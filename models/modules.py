@@ -257,7 +257,8 @@ class LatentEncoder(nn.Module):
         Infer the latent distribution given the global representation
         """
         drop_knowledge = torch.rand(1) < self.knowledge_dropout
-        if drop_knowledge or knowledge is None:
+        # Also skip if knowledge_encoder is None (NP baseline)
+        if drop_knowledge or knowledge is None or self.knowledge_encoder is None:
             k = torch.zeros((R.shape[0], 1, self.knowledge_dim)).to(R.device)
 
         else:
@@ -280,6 +281,12 @@ class LatentEncoder(nn.Module):
         return q_z_stats
 
     def get_knowledge_embedding(self, knowledge):
+        if self.knowledge_encoder is None:
+            # Return zeros for NP baseline
+            batch_size = knowledge.shape[0] if isinstance(knowledge, torch.Tensor) else 1
+            return torch.zeros((batch_size, 1, self.knowledge_dim)).to(
+                knowledge.device if isinstance(knowledge, torch.Tensor) else "cpu"
+            )
         return self.knowledge_encoder(knowledge).unsqueeze(1)
 
 

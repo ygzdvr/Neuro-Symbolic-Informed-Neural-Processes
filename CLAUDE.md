@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository implements **Informed Neural Processes (INPs)** for meta-learning with knowledge integration, from the ICLR 2025 paper "Towards Automated Knowledge Integration From Human-Interpretable Representations". INPs extend Neural Processes to incorporate external knowledge (text descriptions, numeric parameters) during meta-learning.
 
+**NP vs INP**: Setting `--use-knowledge False` trains a standard Neural Process (NP) baseline; `--use-knowledge True` enables the INP with knowledge integration.
+
 ## Commands
 
 ### Environment Setup
@@ -25,9 +27,15 @@ python config.py --project-name <name> --dataset <dataset> [options]
 python models/train.py
 ```
 
-Example for sinusoids:
+Example for sinusoids (INP with knowledge):
 ```bash
 python config.py --project-name INPs_sinusoids --dataset set-trending-sinusoids --use-knowledge True --knowledge-type abc2 --text-encoder set --seed 0
+python models/train.py
+```
+
+Example for NP baseline (no knowledge):
+```bash
+python config.py --project-name INPs_sinusoids --dataset set-trending-sinusoids --use-knowledge False --run-name-prefix np --seed 0
 python models/train.py
 ```
 
@@ -35,6 +43,12 @@ python models/train.py
 Full experiment scripts are in `jobs/`:
 - `jobs/run_sinusoids.sh` - synthetic sinusoid experiments
 - `jobs/run_temperatures.sh` - temperature forecasting experiments
+
+### Evaluation
+After training, analyze results with notebooks in `evaluation/`:
+- `evaluate_sinusoids.ipynb` - base sinusoid experiments
+- `evaluate_sinusoids_dist_shift.ipynb` - distribution shift experiments
+- `evaluate_temperature.ipynb` - temperature forecasting results
 
 ### Pre-commit (Linting)
 ```bash
@@ -66,7 +80,8 @@ Knowledge integration happens in `LatentEncoder` via three merge strategies: `su
 - `Trainer` class manages training loop with WandB logging
 - Uses Optuna for hyperparameter trials (`n_trials` config)
 - Models saved to `./saves/{project_name}/{run_name_prefix}_{run_no}/`
-- Evaluation at every 500 iterations (`EVAL_ITER`)
+- Evaluation at every 500 iterations (`EVAL_ITER`), best model saved after 1500 iterations
+- Each run saves: `model_best.pt`, `optim_best.pt`, and `config.toml`
 
 ### Loss Functions (`models/loss.py`)
 - `ELBOLoss`: variational ELBO with KL divergence, uses `beta` parameter for KL weighting
@@ -102,7 +117,21 @@ Knowledge types determine what information is provided:
 
 ## Data Format
 
-Data files in `data/` directory:
-- `data.csv`: main data with curve_id and value columns
+Data files in `data/` directory (subdirectories: `trending-sinusoids`, `trending-sinusoids-dist-shift`, `temperatures`):
+- `data.csv`: main data with curve_id/LST_DATE and value columns
 - `knowledge.csv`: knowledge associated with each curve_id
 - `splits.csv`: train/val/test split assignments
+
+## Model Loading
+
+To load a trained model for evaluation:
+```python
+from config import Config
+from models.inp import INP
+import torch
+
+config = Config.from_toml("saves/{project}/{run}/config.toml")
+config.device = "cuda" if torch.cuda.is_available() else "cpu"
+model = INP(config)
+model.load_state_dict(torch.load("saves/{project}/{run}/model_best.pt"))
+```

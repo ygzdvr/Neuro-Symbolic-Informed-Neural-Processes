@@ -3,3 +3,5 @@ saves/**
 wandb/**
 figures/*
 .cache/
+core.*
+interpretability_results/**

@@ -5,3 +5,8 @@ figures/*
 .cache/
 core.*
 interpretability_results/**
+CLAUDE.md
+evaluation/interpretability/EXPERIMENT_REPORT.md
+evaluation/interpretability/EXPERIMENTS.md
+evaluation/interpretability/EXPERIMENT_REPORT.pdf
+evaluation/interpretability/REPORT_M1_M2.md

@@ -21,7 +21,8 @@ class INP(nn.Module):
         self.train_num_z_samples = config.train_num_z_samples
         self.test_num_z_samples = config.test_num_z_samples
 
-    def forward(self, x_context, y_context, x_target, y_target, knowledge=None):
+    def forward(self, x_context, y_context, x_target, y_target, knowledge=None, true_params=None):
+        # true_params is unused in INP, included for API compatibility with NSINP
         x_context = self.x_encoder(x_context)  # [bs, num_context, x_transf_dim]
         x_target = self.x_encoder(x_target)  # [bs, num_context, x_transf_dim]
 

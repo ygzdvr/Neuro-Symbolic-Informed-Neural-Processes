@@ -97,7 +97,7 @@ def main():
         type=str,
         help="Text encoder",
         default="none",
-        choices=["simple", "none", "roberta", "set", "set2", "mlp"],
+        choices=["simple", "none", "roberta", "set", "set2", "mlp", "symbolic"],
     )
     parser.add_argument(
         "--freeze-llm",
@@ -223,6 +223,59 @@ def main():
         help="Dimension of knowledge representaiton",
         default=None,
     )
+    # NS-INP specific args
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        help="Model type",
+        default="inp",
+        choices=["inp", "nsinp"],
+    )
+    parser.add_argument(
+        "--equation-vocab-size",
+        type=int,
+        help="Vocabulary size for symbolic equations",
+        default=64,
+    )
+    parser.add_argument(
+        "--equation-max-len",
+        type=int,
+        help="Maximum length of tokenized equations",
+        default=50,
+    )
+    parser.add_argument(
+        "--use-gating",
+        type=str2bool,
+        const=True,
+        nargs="?",
+        help="Use conflict-aware gating (NS-INP)",
+        default=True,
+    )
+    parser.add_argument(
+        "--gating-hidden-dim",
+        type=int,
+        help="Hidden dimension for gating network",
+        default=64,
+    )
+    parser.add_argument(
+        "--gating-init-bias",
+        type=float,
+        help="Initial bias for gating (>0 favors knowledge, <0 favors data)",
+        default=0.0,
+    )
+    parser.add_argument(
+        "--aux-loss-weight",
+        type=float,
+        help="Weight for auxiliary parameter prediction loss (prevents representation collapse)",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--contrastive-loss-weight",
+        type=float,
+        help="Weight for contrastive loss (pushes different equations apart)",
+        default=0.5,
+    )
+
     # saving args
     parser.add_argument(
         "--run-name-prefix", type=str, help="Run name prefix", default="run"

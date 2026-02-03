@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.join(__file__, os.par
 
 from config import Config
 from models.inp import INP
+from models.nsinp import NSINP
 from dataset.utils import setup_dataloaders
 from evaluation.interpretability.base import ExperimentConfig
 
@@ -117,18 +118,22 @@ def load_model(model_info: Dict[str, Any], device: str) -> Tuple[INP, Config, An
     config_dict = toml.load(model_info["config_path"])
     config = Config(**config_dict)
     config.device = device
-    
+
     # Setup dataloaders
     train_dataloader, val_dataloader, _, extras = setup_dataloaders(config)
     for k, v in extras.items():
         config.__dict__[k] = v
-    
-    # Load model
-    model = INP(config)
+
+    # Load model based on model_type
+    model_type = getattr(config, 'model_type', 'inp')
+    if model_type == 'nsinp':
+        model = NSINP(config)
+    else:
+        model = INP(config)
     state_dict = torch.load(model_info["model_path"], map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
-    
+
     return model, config, val_dataloader
 
 

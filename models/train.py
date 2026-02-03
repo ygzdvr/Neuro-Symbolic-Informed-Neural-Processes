@@ -9,9 +9,19 @@ import optuna
 sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.join(__file__, os.pardir))))
 from dataset.utils import setup_dataloaders
 from models.inp import INP
+from models.nsinp import NSINP
 from models.loss import ELBOLoss
 
-EVAL_ITER = 500
+
+def get_model(config):
+    """Instantiate the appropriate model based on config.model_type."""
+    model_type = getattr(config, 'model_type', 'inp')
+    if model_type == "nsinp":
+        return NSINP(config)
+    else:
+        return INP(config)
+
+EVAL_ITER = 100
 SAVE_ITER = 500
 MAX_EVAL_IT = 50
 
@@ -31,7 +41,7 @@ class Trainer:
 
         self.num_epochs = config.num_epochs
 
-        self.model = INP(config)
+        self.model = get_model(config)
         self.model.to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
 
@@ -65,10 +75,14 @@ class Trainer:
 
         self.save_dir = save_dir
 
-    def get_loss(self, x_context, y_context, x_target, y_target, knowledge):
+    def get_loss(self, x_context, y_context, x_target, y_target, knowledge, true_params=None):
         if self.config.sort_context:
             x_context, indices = torch.sort(x_context, dim=1)
             y_context = torch.gather(y_context, 1, indices)
+
+        # Pass true_params to model for auxiliary loss computation (NSINP only)
+        true_params_device = true_params.to(self.device) if true_params is not None else None
+
         if self.config.use_knowledge:
             output = self.model(
                 x_context,
@@ -76,6 +90,7 @@ class Trainer:
                 x_target,
                 y_target=y_target,
                 knowledge=knowledge,
+                true_params=true_params_device,
             )
         else:
             output = self.model(
@@ -85,10 +100,29 @@ class Trainer:
 
         results = {"loss": loss, "kl": kl, "negative_ll": negative_ll}
 
+        # Get auxiliary losses for NSINP models (computed during forward pass)
+        aux_loss_weight = getattr(self.config, 'aux_loss_weight', 1.0)  # Increased default
+        contrastive_loss_weight = getattr(self.config, 'contrastive_loss_weight', 0.5)
+
+        if self.config.use_knowledge:
+            # Auxiliary parameter prediction loss
+            if hasattr(self.model, 'get_auxiliary_loss') and aux_loss_weight > 0:
+                aux_loss = self.model.get_auxiliary_loss()
+                if aux_loss is not None:
+                    results["aux_loss"] = aux_loss
+                    results["loss"] = results["loss"] + aux_loss_weight * aux_loss
+
+            # Contrastive loss (pushes different equations apart)
+            if hasattr(self.model, 'get_contrastive_loss') and contrastive_loss_weight > 0:
+                contrastive_loss = self.model.get_contrastive_loss()
+                if contrastive_loss is not None:
+                    results["contrastive_loss"] = contrastive_loss
+                    results["loss"] = results["loss"] + contrastive_loss_weight * contrastive_loss
+
         return results
 
     def run_batch_train(self, batch):
-        context, target, knowledge, ids = batch
+        context, target, knowledge, extras = batch
         x_context, y_context = context
         x_target, y_target = target
         x_context = x_context.to(self.device)
@@ -96,7 +130,10 @@ class Trainer:
         x_target = x_target.to(self.device)
         y_target = y_target.to(self.device)
 
-        results = self.get_loss(x_context, y_context, x_target, y_target, knowledge)
+        # Get true parameters for auxiliary loss (if available)
+        true_params = extras.get("true_params", None)
+
+        results = self.get_loss(x_context, y_context, x_target, y_target, knowledge, true_params)
 
         return results
 
@@ -131,6 +168,10 @@ class Trainer:
                 wandb.log({"train_loss": loss})
                 wandb.log({"train_negative_ll": negative_ll})
                 wandb.log({"train_kl": kl})
+                if "aux_loss" in results:
+                    wandb.log({"train_aux_loss": results["aux_loss"]})
+                if "contrastive_loss" in results:
+                    wandb.log({"train_contrastive_loss": results["contrastive_loss"]})
 
                 if it % EVAL_ITER == 0 and it > 0:
                     losses, val_loss = self.eval()
@@ -140,7 +181,7 @@ class Trainer:
                     for k, v in losses.items():
                         wandb.log({f"eval_loss_{k}": v})
 
-                    if val_loss < min_eval_loss and it > 1500:
+                    if val_loss < min_eval_loss and it > 100:
                         min_eval_loss = val_loss
                         torch.save(
                             self.model.state_dict(), f"{self.save_dir}/model_best.pt"

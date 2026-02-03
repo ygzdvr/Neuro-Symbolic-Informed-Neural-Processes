@@ -37,3 +37,5 @@ After training the models, results can be analyzed with the following two notebo
 `jobs/run_temperatures.sh` contais commands that need to be run to reproduce the experiments with the tempereatures datasets
 
 After training the models, results can be analyzes with `evaluation/evaluate_temperature.ipynb`
+
+python config.py --project-name NS_INPs_sinusoids --dataset set-trending-sinusoids --model-type inp --use-knowledge True --text-encoder set --knowledge-type abc2 --num-epochs 30 --run-name-prefix inp --seed 0

@@ -116,23 +116,24 @@ def integrated_gradients(
 class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
     """
     M6: Knowledge Saliency & Attribution Analysis
-    
+
     Uses Integrated Gradients to determine which parts of the knowledge
     input are most important for predictions.
-    
+
     Supports:
         - Numeric knowledge (SetEmbedding): Feature-level attribution
         - Text knowledge (RoBERTa): Token-level attribution
-        
+        - Symbolic knowledge (NSINP): Token-level attribution via embeddings
+
     Key outputs:
         - Per-feature/token importance scores
         - Aggregated importance across dataset
         - Visualization of knowledge saliency
     """
-    
+
     name = "m6_knowledge_saliency"
     description = "Integrated Gradients attribution for knowledge inputs"
-    
+
     def __init__(
         self,
         model: nn.Module,
@@ -151,15 +152,21 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
         self.n_steps = n_steps
         self.use_captum = use_captum
         self.text_tokenizer = None
-        
+
         # Check if using text encoder
         self.is_text_knowledge = False
+        # Check if using symbolic encoder (NSINP)
+        self.is_symbolic_knowledge = False
+
         if hasattr(self.model.latent_encoder, 'knowledge_encoder') and \
            self.model.latent_encoder.knowledge_encoder is not None:
             encoder = self.model.latent_encoder.knowledge_encoder
             if hasattr(encoder, 'text_encoder') and hasattr(encoder.text_encoder, 'tokenizer'):
                 self.is_text_knowledge = True
                 self.text_tokenizer = encoder.text_encoder.tokenizer
+            # Check for symbolic encoder (NSINP's SymbolicEquationEncoder)
+            elif hasattr(encoder, 'token_embed') and hasattr(encoder, 'transformer'):
+                self.is_symbolic_knowledge = True
 
     def _get_text_components(self):
         if not hasattr(self.model, "latent_encoder") or self.model.latent_encoder is None:
@@ -268,6 +275,110 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
                 results["token_importance"][token] = results["token_importance"].get(token, 0.0) + score_val
                 results["token_importance_counts"][token] = results["token_importance_counts"].get(token, 0) + 1
 
+    def _compute_symbolic_attribution(
+        self,
+        x_context: torch.Tensor,
+        y_context: torch.Tensor,
+        x_target: torch.Tensor,
+        knowledge_tokens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Compute token-level attribution for symbolic knowledge (NSINP) using IG on token embeddings.
+
+        For symbolic encoders, we compute gradients w.r.t. the token embeddings since
+        token IDs are discrete and not differentiable.
+
+        Args:
+            x_context: [batch, num_context, input_dim]
+            y_context: [batch, num_context, output_dim]
+            x_target: [batch, num_target, input_dim]
+            knowledge_tokens: [batch, seq_len] token IDs
+
+        Returns:
+            Tuple of (token_attributions [batch, seq_len], convergence_delta)
+        """
+        encoder = self.model.latent_encoder.knowledge_encoder
+
+        # Get token embeddings
+        knowledge_tokens = knowledge_tokens.to(self.device)
+        token_embeds = encoder.token_embed(knowledge_tokens)  # [batch, seq_len, d_model]
+
+        # Create padding mask
+        padding_mask = (knowledge_tokens == 0)
+
+        # Baseline: zero embeddings
+        baseline = torch.zeros_like(token_embeds)
+
+        # Pre-compute context encoding (doesn't depend on knowledge)
+        x_context_enc = self.model.x_encoder(x_context)
+        x_target_enc = self.model.x_encoder(x_target)
+        R = self.model.encode_globally(x_context_enc, y_context, x_target_enc)
+
+        def forward_from_embeds(embeds: torch.Tensor) -> torch.Tensor:
+            """Forward pass starting from token embeddings."""
+            batch_size, seq_len, d_model = embeds.shape
+
+            # Prepend [CLS] token
+            cls_tokens = encoder.cls_embed.expand(batch_size, -1, -1)  # [batch, 1, d_model]
+            x = torch.cat([cls_tokens, embeds], dim=1)  # [batch, 1 + seq_len, d_model]
+
+            # Add positional embedding
+            x = x + encoder.pos_embed[:, :x.shape[1], :]
+
+            # Create full padding mask with [CLS] never masked
+            cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=embeds.device)
+            full_padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+
+            # Transformer encoding
+            x = encoder.transformer(x, src_key_padding_mask=full_padding_mask)
+
+            # Use [CLS] token output
+            cls_output = x[:, 0, :]
+            cls_output = encoder.pre_pool_norm(cls_output)
+            z_k = encoder.head(cls_output)  # [batch, d_model]
+            k_embed = z_k.unsqueeze(1)  # [batch, 1, d_model]
+
+            # Project if needed
+            if self.model.latent_encoder.knowledge_proj is not None:
+                k_embed = self.model.latent_encoder.knowledge_proj(k_embed)
+
+            # Apply gating or simple combination with data representation
+            if self.model.latent_encoder.aggregator is not None:
+                encoder_input = self.model.latent_encoder.aggregator(R, k_embed)
+            else:
+                encoder_input = F.relu(R + k_embed)
+
+            # Get latent distribution
+            q_z_stats = self.model.latent_encoder.encoder(encoder_input)
+            q_z_loc, _ = q_z_stats.split(self.model.config.hidden_dim, dim=-1)
+
+            # Use mean of latent (deterministic)
+            z = q_z_loc.unsqueeze(0)
+
+            # Decode
+            R_target = z.expand(-1, -1, x_target.shape[1], -1)
+            p_y_stats = self.model.decoder(x_target_enc, R_target)
+            p_y_loc, _ = p_y_stats.split(self.model.config.output_dim, dim=-1)
+
+            return p_y_loc.mean()
+
+        # Compute IG
+        attributions, delta = integrated_gradients(
+            forward_from_embeds,
+            token_embeds,
+            baseline=baseline,
+            n_steps=self.n_steps,
+            return_convergence_delta=True,
+        )
+
+        # Sum over embedding dimension to get per-token importance
+        token_attributions = attributions.abs().sum(dim=-1)  # [batch, seq_len]
+
+        # Mask out padding tokens
+        token_attributions = token_attributions * (~padding_mask).float()
+
+        return token_attributions, delta
+
     def _disable_knowledge_dropout(self) -> Optional[float]:
         latent_encoder = getattr(self.model, "latent_encoder", None)
         if latent_encoder is None or not hasattr(latent_encoder, "knowledge_dropout"):
@@ -275,7 +386,7 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
         original = float(latent_encoder.knowledge_dropout)
         latent_encoder.knowledge_dropout = 0.0
         return original
-    
+
     def _create_forward_func(
         self,
         x_context: torch.Tensor,
@@ -443,6 +554,7 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
             "config": {
                 "n_steps": self.n_steps,
                 "is_text_knowledge": self.is_text_knowledge,
+                "is_symbolic_knowledge": self.is_symbolic_knowledge,
                 "knowledge_dropout_original": original_dropout,
                 "knowledge_dropout_set_to": 0.0 if original_dropout is not None else None,
             },
@@ -455,25 +567,28 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
             "text_samples": [],
             "token_importance": {},
             "token_importance_counts": {},
+            "symbolic_attributions": [],
+            "symbolic_position_importance": [],
         }
-        
+
         num_batches = min(self.config.num_batches, len(dataloader))
-        
+
         print(f"\nComputing knowledge attributions over {num_batches} batches...")
-        
+        print(f"  Knowledge type: {'symbolic' if self.is_symbolic_knowledge else 'text' if self.is_text_knowledge else 'numeric'}")
+
         try:
             for batch_idx, batch in enumerate(tqdm(dataloader, total=num_batches)):
                 if batch_idx >= num_batches:
                     break
-                
+
                 context, target, knowledge, _ = batch
                 x_context, y_context = context
                 x_target, y_target = target
-                
+
                 x_context = x_context.to(self.device)
                 y_context = y_context.to(self.device)
                 x_target = x_target.to(self.device)
-                
+
                 if not isinstance(knowledge, torch.Tensor):
                     if not self.is_text_knowledge:
                         print("Non-tensor knowledge detected but no text encoder available.")
@@ -490,19 +605,35 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
                     except Exception as e:
                         print(f"Text attribution failed for batch {batch_idx}: {e}")
                     continue
-                
+
                 knowledge = knowledge.to(self.device)
-                
-                # Compute raw knowledge attribution
+
+                # Check if symbolic knowledge (integer tensor = token IDs)
+                is_symbolic = (knowledge.dtype in [torch.long, torch.int, torch.int32, torch.int64])
+
+                if is_symbolic and self.is_symbolic_knowledge:
+                    # Compute symbolic token attribution
+                    try:
+                        token_attr, delta = self._compute_symbolic_attribution(
+                            x_context, y_context, x_target, knowledge
+                        )
+                        results["symbolic_attributions"].append(token_attr.detach().cpu())
+                        results["convergence_deltas"].append(delta)
+                        results["knowledge_values"].append(knowledge.detach().cpu())
+                    except Exception as e:
+                        print(f"Symbolic attribution failed for batch {batch_idx}: {e}")
+                    continue
+
+                # Compute raw knowledge attribution (for numeric knowledge)
                 try:
                     raw_attr, delta = self._compute_raw_knowledge_attribution(
                         x_context, y_context, x_target, knowledge
                     )
-                    
+
                     results["raw_attributions"].append(raw_attr.detach().cpu())
                     results["convergence_deltas"].append(delta)
                     results["knowledge_values"].append(knowledge.detach().cpu())
-                    
+
                 except Exception as e:
                     print(f"Attribution failed for batch {batch_idx}: {e}")
                     continue
@@ -591,7 +722,51 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
                     "relative_importance": relative_importance.tolist(),
                     "num_features": len(mean_importance),
                 }
-        
+
+        # Aggregate symbolic attributions
+        if results["symbolic_attributions"]:
+            all_symbolic = torch.cat(results["symbolic_attributions"], dim=0)  # [N, seq_len]
+
+            # Compute position-wise importance (mean across samples)
+            position_importance = all_symbolic.mean(dim=0)  # [seq_len]
+            position_std = all_symbolic.std(dim=0)
+
+            # Normalize
+            total_importance = position_importance.sum() + 1e-8
+            relative_position_importance = position_importance / total_importance
+
+            # Find most important positions
+            top_positions = torch.argsort(position_importance, descending=True)[:10]
+
+            results["symbolic_aggregated"] = {
+                "position_importance": position_importance.tolist(),
+                "position_std": position_std.tolist(),
+                "relative_position_importance": relative_position_importance.tolist(),
+                "top_positions": top_positions.tolist(),
+                "seq_len": int(all_symbolic.shape[1]),
+                "num_samples": int(all_symbolic.shape[0]),
+            }
+
+            # Compute early/middle/late position importance
+            seq_len = all_symbolic.shape[1]
+            third = seq_len // 3
+            early_imp = position_importance[:third].sum().item()
+            middle_imp = position_importance[third:2*third].sum().item()
+            late_imp = position_importance[2*third:].sum().item()
+            total = early_imp + middle_imp + late_imp + 1e-8
+
+            results["symbolic_position_distribution"] = {
+                "early": early_imp / total,
+                "middle": middle_imp / total,
+                "late": late_imp / total,
+            }
+
+            results["interpretation"] = (
+                f"Symbolic attribution computed. Position distribution: "
+                f"early {early_imp/total:.1%}, middle {middle_imp/total:.1%}, late {late_imp/total:.1%}. "
+                f"Top positions: {top_positions[:5].tolist()}"
+            )
+
         # Convergence check
         deltas = results["convergence_deltas"]
         if deltas:
@@ -649,9 +824,11 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
         results["text_attributions"] = [a.tolist() for a in results["text_attributions"][:5]]
         results["text_tokens"] = results["text_tokens"][:5]
         results["text_samples"] = results["text_samples"][:5]
+        results["symbolic_attributions"] = [a.tolist() for a in results["symbolic_attributions"][:10]]
         if "token_importance" in results:
             results.pop("token_importance", None)
             results.pop("token_importance_counts", None)
+        results.pop("symbolic_position_importance", None)  # Remove empty list
         
         self.results = results
         self.save_results(results)
@@ -674,21 +851,26 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
         try:
             import matplotlib.pyplot as plt
             import seaborn as sns
-            
+
             # Set styling
             sns.set(font_scale=1.3)
             sns.set_style("whitegrid")
-            
+
             # Create palette with enough colors
             palette = sns.color_palette("rocket", n_colors=10)
             sns.set_palette(palette)
-            
+
+            plots_dir = self.output_dir / "plots"
+            plots_dir.mkdir(parents=True, exist_ok=True)
+
+            # Handle symbolic attributions
+            if "symbolic_aggregated" in results:
+                self._save_symbolic_visualization(results, plots_dir, palette)
+                return
+
             if "aggregated" not in results and "aggregated_value_only" not in results:
                 print("No aggregated results to visualize")
                 return
-            
-            plots_dir = self.output_dir / "plots"
-            plots_dir.mkdir(parents=True, exist_ok=True)
             
             fig, axes = plt.subplots(1, 2, figsize=(14, 6))
             
@@ -754,9 +936,97 @@ class KnowledgeSaliencyExperiment(InterpretabilityExperiment):
                 plt.close(fig)
             
             print(f"  M6 visualizations saved to {plots_dir}")
-            
+
         except ImportError as e:
             print(f"Visualization libraries not available: {e}")
+
+    def _save_symbolic_visualization(self, results: Dict[str, Any], plots_dir: Path, palette):
+        """Visualization for symbolic knowledge attributions (NSINP)."""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        symbolic_agg = results["symbolic_aggregated"]
+        position_imp = symbolic_agg["relative_position_importance"]
+        seq_len = symbolic_agg["seq_len"]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Left: Position-wise importance bar chart
+        ax1 = axes[0]
+        positions = list(range(min(len(position_imp), 30)))  # Show first 30 positions
+        importance = [position_imp[i] for i in positions]
+        colors = sns.color_palette("rocket", n_colors=len(positions))
+        bars = ax1.bar(positions, importance, color=colors, edgecolor='black', alpha=0.8)
+        ax1.set_xlabel("Token Position", fontsize=12)
+        ax1.set_ylabel("Relative Importance", fontsize=12)
+        ax1.set_title("Symbolic Knowledge Position Importance\n(Integrated Gradients)", fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3, axis='y')
+
+        # Highlight top 5 positions
+        top_positions = symbolic_agg["top_positions"][:5]
+        for pos in top_positions:
+            if pos < len(bars):
+                bars[pos].set_edgecolor('red')
+                bars[pos].set_linewidth(2)
+
+        # Middle: Position distribution (early/middle/late)
+        ax2 = axes[1]
+        if "symbolic_position_distribution" in results:
+            dist = results["symbolic_position_distribution"]
+            labels = ["Early\n(tokens 0-⅓)", "Middle\n(tokens ⅓-⅔)", "Late\n(tokens ⅔-end)"]
+            values = [dist["early"], dist["middle"], dist["late"]]
+            colors = sns.color_palette("rocket", n_colors=3)
+            wedges, texts, autotexts = ax2.pie(values, labels=labels, colors=colors,
+                                               autopct='%1.1f%%', startangle=90,
+                                               wedgeprops=dict(edgecolor='white', linewidth=2))
+            ax2.set_title("Position Distribution\n(Early/Middle/Late)", fontsize=14, fontweight='bold')
+
+        # Right: Heatmap of position importance
+        ax3 = axes[2]
+        # Reshape to 2D for heatmap visualization
+        n_cols = 10
+        n_rows = (len(position_imp) + n_cols - 1) // n_cols
+        heatmap_data = np.zeros((n_rows, n_cols))
+        for i, val in enumerate(position_imp):
+            row, col = i // n_cols, i % n_cols
+            heatmap_data[row, col] = val
+
+        sns.heatmap(heatmap_data, ax=ax3, cmap='rocket', annot=False,
+                    xticklabels=[str(i) for i in range(n_cols)],
+                    yticklabels=[f"{i*n_cols}-{(i+1)*n_cols-1}" for i in range(n_rows)],
+                    cbar_kws={'label': 'Importance'})
+        ax3.set_xlabel("Position (mod 10)", fontsize=12)
+        ax3.set_ylabel("Position Range", fontsize=12)
+        ax3.set_title("Position Importance Heatmap", fontsize=14, fontweight='bold')
+
+        plt.tight_layout()
+        fig.savefig(plots_dir / "m6_feature_importance.png", dpi=150, bbox_inches='tight', facecolor='white')
+        fig.savefig(plots_dir / "m6_feature_importance.pdf", dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+
+        # Convergence plot
+        if results.get("convergence_deltas"):
+            fig, ax = plt.subplots(figsize=(10, 6))
+            deltas = results["convergence_deltas"]
+            ax.hist(deltas, bins=25, color=palette[0],
+                   edgecolor='black', alpha=0.7)
+            ax.axvline(x=np.mean(deltas), color='red', linestyle='--', linewidth=2,
+                      label=f'Mean: {np.mean(deltas):.4f}')
+            ax.axvline(x=0.1, color='green', linestyle=':', linewidth=2,
+                      label='Convergence threshold')
+            ax.set_xlabel('Convergence Delta', fontsize=12)
+            ax.set_ylabel('Count', fontsize=12)
+            ax.set_title('Integrated Gradients Convergence Check\n(Smaller = Better)',
+                        fontsize=14, fontweight='bold')
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            fig.savefig(plots_dir / "m6_convergence.png", dpi=150, bbox_inches='tight', facecolor='white')
+            fig.savefig(plots_dir / "m6_convergence.pdf", dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+
+        print(f"  M6 symbolic visualizations saved to {plots_dir}")
 
 
 def visualize_text_attribution(

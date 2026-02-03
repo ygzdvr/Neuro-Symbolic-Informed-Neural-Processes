@@ -9,13 +9,24 @@ from dataset.dataset import (
     SetKnowledgeTrendingSinusoidsDistShift,
     Temperatures,
 )
+from dataset.symbolic_dataset import (
+    SymbolicSinusoidDataset,
+    SymbolicSinusoidDatasetDistShift,
+)
 
 
 def collate_fn(batch, kwargs, collate_knowledge=True):
     num_context_ls = list(range(kwargs["min_num_context"], kwargs["max_num_context"]))
     num_context = np.random.choice(num_context_ls)
 
-    x, y, knowledge = zip(*batch)
+    # Handle both 3-tuple (x, y, knowledge) and 4-tuple (x, y, knowledge, true_params)
+    if len(batch[0]) == 4:
+        x, y, knowledge, true_params = zip(*batch)
+        has_true_params = True
+    else:
+        x, y, knowledge = zip(*batch)
+        true_params = None
+        has_true_params = False
     num_samples = x[0].shape[0]
     x_size = x[0].shape[1]
     y_size = y[0].shape[1]
@@ -78,6 +89,10 @@ def collate_fn(batch, kwargs, collate_knowledge=True):
 
     extras = {"x": x, "y": y, "context_idx": context_idx}
 
+    # Include true parameters if available (for auxiliary loss)
+    if has_true_params:
+        extras["true_params"] = torch.stack(true_params)
+
     if collate_knowledge:
         knowledge = torch.stack(knowledge)
 
@@ -88,6 +103,8 @@ def get_dataloader(dataset, config):
     if config.dataset in [
         "set-trending-sinusoids",
         "set-trending-sinusoids-dist-shift",
+        "symbolic-sinusoids",
+        "symbolic-sinusoids-dist-shift",
     ]:
         collate_knowledge = True
     else:
@@ -132,6 +149,50 @@ def setup_dataloaders(config):
         )
         val_dataset = Temperatures(split="val", knowledge_type=config.knowledge_type)
         test_dataset = Temperatures(split="test", knowledge_type=config.knowledge_type)
+
+    elif config.dataset == "symbolic-sinusoids":
+        max_len = getattr(config, 'equation_max_len', 50)
+        vocab_size = getattr(config, 'equation_vocab_size', 64)
+        train_dataset = SymbolicSinusoidDataset(
+            split="train",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
+        val_dataset = SymbolicSinusoidDataset(
+            split="val",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
+        test_dataset = SymbolicSinusoidDataset(
+            split="test",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
+
+    elif config.dataset == "symbolic-sinusoids-dist-shift":
+        max_len = getattr(config, 'equation_max_len', 50)
+        vocab_size = getattr(config, 'equation_vocab_size', 64)
+        train_dataset = SymbolicSinusoidDatasetDistShift(
+            split="train",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
+        val_dataset = SymbolicSinusoidDatasetDistShift(
+            split="val",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
+        test_dataset = SymbolicSinusoidDatasetDistShift(
+            split="test",
+            knowledge_type=config.knowledge_type,
+            max_len=max_len,
+            vocab_size=vocab_size,
+        )
 
     else:
         raise ValueError(f"Unknown dataset {config.dataset}")
